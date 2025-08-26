@@ -1,0 +1,216 @@
+services:
+
+  flyway:
+    image: flyway/flyway:9
+    container_name: booking_flyway
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      FLYWAY_TARGET: ${MIGRATION_VERSION:-latest}
+      FLYWAY_URL: jdbc:postgresql://${POSTGRES_HOST}:${POSTGRES_PORT}/${DB_NAME}
+      FLYWAY_USER: ${DB_ADMIN_USER}
+      FLYWAY_PASSWORD: ${DB_ADMIN_PASSWORD}
+    volumes:
+      - ./migrations:/flyway/sql
+    entrypoint: [ "flyway", "migrate" ]
+    restart: "no"
+    networks:
+      - app-network
+
+  seeder:
+    build: ./seed
+    container_name: booking_seeder
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: ${DB_ADMIN_USER}
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      APP_ENV: ${APP_ENV:-prod}
+      SEED_COUNT: ${SEED_COUNT:-1}
+    volumes:
+      - ./seed:/seed:ro
+    restart: "no"
+    networks:
+      - app-network
+
+  query-benchmark:
+    image: python:3.12-slim
+    container_name: query-benchmark
+    depends_on:
+      grafana:
+        condition: service_started
+    working_dir: /app
+    volumes:
+      - ./benchmarks:/app
+    environment:
+      DB_HOST: ${POSTGRES_HOST}
+      DB_PORT: ${POSTGRES_PORT}
+      DB_NAME: ${DB_NAME}
+      DB_USER: ${DB_ADMIN_USER}
+      DB_PASSWORD: ${DB_ADMIN_PASSWORD}
+      SQL_FILE: /app/test_queries.sql
+      INTERVAL: 30
+      PROM_PORT: 8000
+    command:
+      - sh
+      - -c
+      - pip install --no-cache-dir -r requirements.txt && python benchmark.py
+    ports:
+      - "8000:8000"
+    networks:
+      - app-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: booking_prometheus
+    depends_on:
+      seeder:
+          condition: service_completed_successfully
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - app-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: booking_grafana
+    depends_on:
+      prometheus:
+            condition: service_started
+    ports:
+      - "3000:3000"
+    networks:
+      - app-network
+
+  db-backup:
+    build: ./db-backup
+    container_name: booking_db_backup
+    depends_on:
+      flyway:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${DB_NAME}
+      POSTGRES_USER: ${DB_ADMIN_USER}
+      POSTGRES_PASSWORD: ${DB_ADMIN_PASSWORD}
+      BACKUP_DIR: /backups
+      BACKUP_INTERVAL_CRON: ${BACKUP_INTERVAL_CRON}
+      BACKUP_RETENTION_COUNT: ${BACKUP_RETENTION_COUNT}
+    volumes:
+      - ./db-backups:/backups
+    networks:
+      - app-network
+
+  etcd1: &etcd
+    image: patroni
+    networks: [ app-network ]
+    environment:
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_STATE: new
+      ETCD_INITIAL_CLUSTER_TOKEN: tutorial
+      ETCD_UNSUPPORTED_ARCH: arm64
+    container_name: etcd1
+    hostname: etcd1
+    command: etcd --name etcd1 --initial-advertise-peer-urls http://etcd1:2380
+
+  etcd2:
+    <<: *etcd
+    container_name: etcd2
+    hostname: etcd2
+    command: etcd --name etcd2 --initial-advertise-peer-urls http://etcd2:2380
+
+  etcd3:
+    <<: *etcd
+    container_name: etcd3
+    hostname: etcd3
+    command: etcd --name etcd3 --initial-advertise-peer-urls http://etcd3:2380
+
+  haproxy:
+    image: patroni
+    networks: [ app-network ]
+    env_file: patroni.env
+    hostname: haproxy
+    container_name: haproxy
+    ports:
+      - "15000:5000"
+      - "15001:5001"
+    command: haproxy
+    environment: &haproxy_env
+      ETCDCTL_ENDPOINTS: http://etcd1:2379,http://etcd2:2379,http://etcd3:2379
+      PATRONI_ETCD3_HOSTS: "'etcd1:2379','etcd2:2379','etcd3:2379'"
+      PATRONI_SCOPE: patroni
+
+  patroni1:
+    image: patroni
+    networks: [ app-network ]
+    env_file: patroni.env
+    hostname: patroni1
+    container_name: patroni1
+    environment:
+      <<: *haproxy_env
+      PATRONI_NAME: patroni1
+
+  patroni2:
+    image: patroni
+    networks: [ app-network ]
+    env_file: patroni.env
+    hostname: patroni2
+    container_name: patroni2
+    environment:
+      <<: *haproxy_env
+      PATRONI_NAME: patroni2
+
+  patroni3:
+    image: patroni
+    networks: [ app-network ]
+    env_file: patroni.env
+    hostname: patroni3
+    container_name: patroni3
+    environment:
+      <<: *haproxy_env
+      PATRONI_NAME: patroni3
+
+  init:
+    image: postgres:16
+    container_name: init
+    networks: [ app-network ]
+    volumes:
+      - ./init:/init_scripts
+    env_file:
+      - .env
+    depends_on:
+      haproxy:
+        condition: service_started
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DB_NAME: ${DB_NAME}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      DB_ADMIN_USER: ${DB_ADMIN_USER}
+      DB_ADMIN_PASSWORD: ${DB_ADMIN_PASSWORD}
+    entrypoint: >
+      bash -c "
+      echo 'Waiting for PostgreSQL cluster to be ready...';
+      until pg_isready -h $${POSTGRES_HOST} -p $${POSTGRES_PORT}; do sleep 2; done;
+      echo 'Cluster is ready. Creating database and user...';
+      run-parts --regex '\.sh$' /init_scripts --exit-on-error;"
+
+networks:
+  app-network:
